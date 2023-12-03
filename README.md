@@ -246,3 +246,13 @@ Response body example:
   }
 ]`
 ___
+## Additional tasks
+1.I organized testing by Pytest.
+
+3.Prepared docker-compose to launch all project services.
+
+5.You can see description of API at `/api/docs/`.
+
+9.The remote service may be unavailable, take a long time to respond to requests, or provide incorrect responses. These problems are solved by using Celery.
+
+12.I organized service logging.
