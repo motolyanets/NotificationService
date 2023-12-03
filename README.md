@@ -19,6 +19,3 @@ And apply the migration:
 ```
 docker-compose exec backend python manage.py migrate
 ```
-
-## Creator
-[Andrey Motolyanets](https://github.com/motolyanets)
