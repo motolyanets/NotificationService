@@ -1,82 +1,146 @@
 import json
+import os
 from datetime import datetime
 
 import pytz
 import requests
-from rest_framework.response import Response
+from dotenv import load_dotenv
+from drf_spectacular.utils import extend_schema_view, extend_schema
 from rest_framework.viewsets import ModelViewSet
-from django_celery_beat.models import PeriodicTask, IntervalSchedule
+from django_celery_beat.models import PeriodicTask, IntervalSchedule, ClockedSchedule
 
-from client.models import Client
+from user.models import User
 from message.models import Message
 from newsletter.models import Newsletter
 from newsletter.serializers import NewsletterSerializer
+from user.views import logger
+
+load_dotenv()
 
 
-def sending_message(newsletter: Newsletter, client: Client):
-    response = requests.post(url=f'https://probe.fbrq.cloud/v1/send/{client.pk}',
-                             json={"id": client.pk,
-                                   "phone": client.phone_number,
-                                   "text": newsletter.messages_text
-                                   },
-                             headers={
-                                 "accept": "application/json",
-                                 "Authorization": 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHA'
-                                                  'iOjE3MzIxODYyODQsImlzcyI6ImZhYnJpcXVlIiwibmFtZSI6Im'
-                                                  'h0dHBzOi8vdC5tZS9hbmRyZXltb3RvbHlhbmV0cyJ9.tq6pC1gb'
-                                                  'wkWXMybLPdI_KEgZ5y1NClayj5HijU9Medc',
-                                 "Content - Type": "application / json"}
-                             )
-    return response
-
-
-def starting_newsletter(newsletter: Newsletter, clients: list[Client]):
-    for client in clients:
-        Message(
-            dispatch_status='in progress',
-            newsletter_id=newsletter,
-            client_id=client,
-        ).save()
-
-        response = sending_message(newsletter, client)
-
-        message = Message.objects.filter(newsletter_id=newsletter, client_id=client).first()
-
-        if response.json()['message'] == 'OK':
-            message.dispatch_status = 'delivered'
-            message.save()
-            print(f'Message #{message.pk} was delivered')
-        else:
-            print(f'Message #{message.pk} wasn\'t delivered. It was sent to schedule.')
-            interval = IntervalSchedule.objects.get_or_create(every=50, period='seconds')
-            PeriodicTask.objects.create(
-                name=f'Repeat sending message #{message.pk}',
-                task='repeat_sending_message',
-                interval=interval[0],
-                kwargs=json.dumps({'newsletter_pk': newsletter.pk, 'client_pk': client.pk}),
-                start_time=datetime.now(tz=pytz.utc),
-            )
-
-
+@extend_schema_view(
+    create=extend_schema(summary='Create a new newsletter.'),
+    retrieve=extend_schema(summary='Get the newsletter.'),
+    update=extend_schema(summary='Update the newsletter.'),
+    partial_update=extend_schema(summary='Partial update the newsletter.'),
+    destroy=extend_schema(summary='Delete the newsletter.'),
+    list=extend_schema(summary='Get list of newsletters.'),
+)
 class NewsletterViewSet(ModelViewSet):
-    queryset = Newsletter.objects.all().order_by('start_time')
+    queryset = Newsletter.objects.all()
     serializer_class = NewsletterSerializer
 
-    def create(self, request, *args, **kwargs):
-        response = super().create(request, *args, **kwargs)
-        self.accepting_newsletter(response)
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        if response.status_code == 200:
+            logger.info(f'Newsletter #{response.data["id"]} was updated!')
         return response
 
+    def destroy(self, request, *args, **kwargs):
+        response = super().destroy(request, *args, **kwargs)
+        if response.status_code == 204:
+            logger.info(f'Newsletter #{kwargs["pk"]} was deleted!')
+        return response
+
+    def perform_create(self, serializer):
+        serializer.save()
+        user_filter = serializer.data['user_filter']
+        newsletter_id = serializer.data['id']
+        try:
+            user_filter = int(user_filter)
+        except ValueError:
+            pass
+        logger.info(f'Newsletter #{newsletter_id} was registered!')
+        self.accept_newsletter(user_filter, newsletter_id)
+
     @staticmethod
-    def accepting_newsletter(response: Response):
-        clients = Client.objects.all().filter(tag=response.data['client_filter'])
-        newsletter = Newsletter.objects.filter(pk=response.data['id']).first()
+    def accept_newsletter(user_filter: str | int, newsletter_id: int):
+        if isinstance(user_filter, int):
+            all_users = User.objects.all()
+            users = []
+            for user in all_users:
+                if user.mobile_operator_code == user_filter:
+                    users.append(user)
+        else:
+            users = User.objects.filter(tag=user_filter)
+
+        users_id = [user.id for user in users]
+
+        newsletter = Newsletter.objects.filter(id=newsletter_id).first()
+
+        if not newsletter:
+            raise Exception('Newsletter not found!')
 
         if newsletter.start_time <= datetime.now(tz=pytz.utc) <= newsletter.finish_time:
-            starting_newsletter(newsletter, clients)
+            NewsletterViewSet.start_newsletter(newsletter_id, users_id)
         elif newsletter.start_time >= datetime.now(tz=pytz.utc):
-            # Код для отложенной старта рассылки
-            pass
+            logger.info(f'Newsletter #{newsletter.id} has been sent to the schedule! '
+                        f'It starts at {newsletter.start_time}.')
+            clock, _ = ClockedSchedule.objects.get_or_create(clocked_time=newsletter.start_time)
+            PeriodicTask.objects.create(
+                name=f'Delayed start newsletter #{newsletter.id}',
+                task='delayed_start_newsletter',
+                clocked=clock,
+                kwargs=json.dumps({'newsletter_id': newsletter.id, 'users_id': users_id}),
+                expires=newsletter.finish_time,
+                one_off=True,
+            )
 
+        clock, _ = ClockedSchedule.objects.get_or_create(clocked_time=newsletter.finish_time)
+        PeriodicTask.objects.create(
+            name=f'Check newsletter #{newsletter.id}',
+            task='check_newsletter',
+            clocked=clock,
+            kwargs=json.dumps({'newsletter_id': newsletter.id}),
+            one_off=True,
+        )
 
+    @staticmethod
+    def start_newsletter(newsletter_id: int, users_id: list[int]):
+        logger.info(f'Newsletter #{newsletter_id} starts!')
+        newsletter = Newsletter.objects.filter(id=newsletter_id).first()
+        if not newsletter:
+            raise Exception('Newsletter not found!')
 
+        for user_id in users_id:
+            user = User.objects.filter(id=user_id).first()
+            if not newsletter:
+                raise Exception('User not found!')
+
+            message = Message.objects.create(
+                status='in progress',
+                newsletter_id=newsletter,
+                user_id=user
+            )
+
+            response = NewsletterViewSet.send_message(newsletter, user)
+
+            if response.json()['message'] == 'OK':
+                message.status = 'delivered'
+                message.save()
+                logger.info(f'Message #{message.id} was delivered to User #{message.user_id_id}')
+            else:
+                logger.info(f'Message #{message.id} wasn\'t delivered. It was sent to schedule.')
+                interval, _ = IntervalSchedule.objects.get_or_create(every=1, period='minutes')
+                PeriodicTask.objects.create(
+                    name=f'Repeat sending message #{message.id}',
+                    task='repeat_sending_message',
+                    interval=interval,
+                    kwargs=json.dumps({'newsletter_id': newsletter.id, 'user_id': user.id}),
+                    start_time=datetime.now(tz=pytz.utc),
+                    expires=newsletter.finish_time,
+                )
+
+    @staticmethod
+    def send_message(newsletter: Newsletter, user: User):
+        API_TOKEN = os.getenv('API_TOKEN')
+        API_URL = os.getenv('API_URL')
+
+        response = requests.post(url=f'{API_URL}{user.pk}',
+                                 json={'id': user.pk,
+                                       'phone': user.phone_number,
+                                       'text': newsletter.messages_text
+                                       },
+                                 headers={'Authorization': f'Bearer {API_TOKEN}'}
+                                 )
+        return response

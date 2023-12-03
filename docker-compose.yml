@@ -31,6 +31,7 @@ services:
   celery:
     build: ./notification_service
     command: celery -A notification_service worker --beat
+    restart: always
     volumes:
       - ./notification_service:/app/backend
     depends_on:
